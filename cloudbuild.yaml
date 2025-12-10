@@ -1,0 +1,27 @@
+substitutions:
+  _REGION: "asia-southeast2"
+  _REPOSITORY: "prosperal-images"
+  _IMAGE_NAME: "lead-worker"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  - id: "Build"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "-f"
+      - "Dockerfile"
+      - "-t"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
+      - "."
+
+  - id: "Push"
+    name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
+
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_IMAGE_NAME}:$SHORT_SHA"
