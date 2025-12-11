@@ -11,7 +11,7 @@ Endpoints:
 Run server:
     uvicorn main:app --reload --port 8000
     
-Test endpoints:
+Test endpoints(locally):
     curl http://localhost:8000/health
     curl -X POST http://localhost:8000/score -H "Content-Type: application/json" -d @sample_request.json
     curl -X POST http://localhost:8000/bulk-score -F "file=@leads.csv"
@@ -22,6 +22,9 @@ import io
 import csv
 import random
 import tempfile
+import os
+import boto3
+import botocore
 from contextlib import asynccontextmanager
 from typing import List, Literal, Optional
 from pathlib import Path
@@ -31,6 +34,79 @@ from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
+
+try:
+    from .inference_service import (
+        load_artifacts,
+        run_inference,
+        InferenceError,
+        Artifacts,
+        MAX_BULK_ROWS,
+        REQUIRED_INPUT_FIELDS,
+        validate_dataframe_columns,
+        clean_dataframe,
+        run_bulk_inference,
+    )
+except Exception:
+    from inference_service import (
+        load_artifacts,
+        run_inference,
+        InferenceError,
+        Artifacts,
+        MAX_BULK_ROWS,
+        REQUIRED_INPUT_FIELDS,
+        validate_dataframe_columns,
+        clean_dataframe,
+        run_bulk_inference,
+    )
+
+# --------- B2 / S3 helper (lazy client) ----------
+_s3_client = None
+
+def get_s3_resource():
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+
+    endpoint = os.environ.get("B2_S3_ENDPOINT")
+    access_key = os.environ.get("B2_KEY_ID")
+    secret_key = os.environ.get("B2_APP_KEY")
+
+    if not all([endpoint, access_key, secret_key]):
+        # Do not raise HTTPException here; caller will handle if B2 required
+        logger.warning("B2 env credentials are not fully set")
+        _s3_client = None
+        return None
+
+    _s3_client = boto3.resource(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+    )
+    return _s3_client
+
+
+def fetch_b2_object_bytes(bucket: str, key: str) -> bytes:
+    s3 = get_s3_resource()
+    if s3 is None:
+        raise HTTPException(status_code=500, detail={"error": "missing_b2_env", "message": "B2 credentials (B2_S3_ENDPOINT/B2_KEY_ID/B2_APP_KEY) not configured"})
+
+    try:
+        obj = s3.Object(bucket, key)
+        data = obj.get()["Body"].read()
+        if not data:
+            raise HTTPException(status_code=500, detail={"error": "b2_empty_file", "message": f"File is empty: s3://{bucket}/{key}"})
+        return data
+    except botocore.exceptions.ClientError as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            raise HTTPException(status_code=404, detail={"error": "b2_not_found", "message": f"Object not found: s3://{bucket}/{key}"})
+        if code in ("403", "AccessDenied"):
+            raise HTTPException(status_code=403, detail={"error": "b2_access_denied", "message": f"Access denied: s3://{bucket}/{key}"})
+        logger.exception("B2 client error")
+        raise HTTPException(status_code=500, detail={"error": "b2_client_error", "message": str(e)})
+
 
 def reservoir_sample_from_bytes(content_bytes: bytes, sample_size: int = 1000, seed: Optional[int] = None) -> list:
     """
@@ -53,6 +129,57 @@ def reservoir_sample_from_bytes(content_bytes: bytes, sample_size: int = 1000, s
                 reservoir[j] = row
     return reservoir
 
+
+
+def fetch_default_b2_dataset() -> bytes:
+    
+    endpoint = os.environ.get("B2_S3_ENDPOINT")
+    access_key = os.environ.get("B2_KEY_ID")
+    secret_key = os.environ.get("B2_APP_KEY")
+    bucket = os.environ.get("B2_BUCKET")
+    key = os.environ.get("INPUT_PATH")
+
+    if not all([endpoint, access_key, secret_key, bucket, key]):
+        raise HTTPException(status_code=500, detail={
+            "error": "missing_b2_env",
+            "message": "One or more required B2 env vars are missing"
+        })
+
+    try:
+        s3 = boto3.resource(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
+        )
+        obj = s3.Object(bucket, key)
+        data = obj.get()["Body"].read()
+
+        if not data:
+            raise HTTPException(status_code=500, detail={
+                "error": "b2_empty_file",
+                "message": f"File is empty: s3://{bucket}/{key}"
+            })
+
+        return data
+
+    except botocore.exceptions.ClientError as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
+        if code in ("404", "NoSuchKey"):
+            raise HTTPException(status_code=404, detail={
+                "error": "b2_not_found",
+                "message": f"Object not found: s3://{bucket}/{key}"
+            })
+        elif code in ("403", "AccessDenied"):
+            raise HTTPException(status_code=403, detail={
+                "error": "b2_access_denied",
+                "message": f"Cannot access s3://{bucket}/{key}"
+            })
+
+        raise HTTPException(status_code=500, detail={
+            "error": "b2_client_error",
+            "message": str(e)
+        })
 
 try:
     # Preferred when running as package (uvicorn service.main:app)
@@ -526,9 +653,12 @@ async def score_lead(features: LeadFeatures):
 
 @app.post("/bulk-score", response_model=BulkScoreResponse, tags=["Inference"])
 async def bulk_score_leads(
-    file: UploadFile = File(..., description="CSV file containing leads data"),
+    file: UploadFile = File(None, description="CSV file containing leads data"),
     inference_sample: Optional[int] = 1000,
-    seed: Optional[int] = None
+    seed: Optional[int] = None,
+    b2_bucket: Optional[str] = None,
+    b2_key: Optional[str] = None,
+    b2_uri: Optional[str] = None
 ):
     """
     Bulk lead scoring inference endpoint.
@@ -562,11 +692,36 @@ async def bulk_score_leads(
     - Baris dengan missing values akan di-drop dan dilaporkan di invalid_rows
     - Kolom yang tidak dikenal akan diabaikan (hanya log warning)
     """
+    
     if artifacts is None:
         raise InferenceError("Model artifacts not loaded")
+    
+    # read uploaded file content if provided
+    content = None
+    if file is not None:
+        try:
+            content = await file.read()
+            if content:
+                logger.info("Using uploaded CSV file for bulk inference")
+        except Exception as e:
+            logger.warning(f"Failed to read uploaded file: {e}")
+            content = None
+
+    # fetch from B2 if no uploaded file
+    if not content:
+        logger.info("No valid CSV uploaded, fetching dataset from Backblaze B2")
+        content = fetch_default_b2_dataset()
+
+    try:
+        df_full = pd.read_csv(io.StringIO(content.decode("utf-8")))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={
+            "error": "CSV parsing error",
+            "message": str(e)
+        })
 
     # Validate file extension quickly
-    if not file.filename.lower().endswith(".csv"):
+    if file is not None and not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail={
             "error": "Invalid file type",
             "message": "Only CSV files are accepted",
@@ -578,6 +733,7 @@ async def bulk_score_leads(
     if not content:
         raise HTTPException(status_code=400, detail={"error": "Empty file", "message": "Uploaded CSV file is empty"})
     try:
+
         df_full = pd.read_csv(io.StringIO(content.decode("utf-8")))
     except Exception as e:
         raise HTTPException(status_code=400, detail={"error": "CSV parsing error", "message": str(e)})

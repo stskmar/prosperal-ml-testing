@@ -76,6 +76,10 @@
     "scikit-learn": "latest",
     "shap": "latest",
     "pandas": "latest",
-    "numpy": "latest"
+    "numpy": "latest",
+    "joblib": "latest",
+    "fastapi": "latest",
+    "uvicorn": "latest",
+    "boto3": "latest"
   }
 }
