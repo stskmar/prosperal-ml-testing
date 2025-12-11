@@ -11,7 +11,7 @@ Endpoints:
 Run server:
     uvicorn main:app --reload --port 8000
     
-Test endpoints(locally):
+Test endpoints:
     curl http://localhost:8000/health
     curl -X POST http://localhost:8000/score -H "Content-Type: application/json" -d @sample_request.json
     curl -X POST http://localhost:8000/bulk-score -F "file=@leads.csv"
@@ -21,10 +21,7 @@ import logging
 import io
 import csv
 import random
-import tempfile
-import os
-import boto3
-import botocore
+from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 from typing import List, Literal, Optional
 from pathlib import Path
@@ -35,78 +32,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict
 
-try:
-    from .inference_service import (
-        load_artifacts,
-        run_inference,
-        InferenceError,
-        Artifacts,
-        MAX_BULK_ROWS,
-        REQUIRED_INPUT_FIELDS,
-        validate_dataframe_columns,
-        clean_dataframe,
-        run_bulk_inference,
-    )
-except Exception:
-    from inference_service import (
-        load_artifacts,
-        run_inference,
-        InferenceError,
-        Artifacts,
-        MAX_BULK_ROWS,
-        REQUIRED_INPUT_FIELDS,
-        validate_dataframe_columns,
-        clean_dataframe,
-        run_bulk_inference,
-    )
-
-# --------- B2 / S3 helper (lazy client) ----------
-_s3_client = None
-
-def get_s3_resource():
-    global _s3_client
-    if _s3_client is not None:
-        return _s3_client
-
-    endpoint = os.environ.get("B2_S3_ENDPOINT")
-    access_key = os.environ.get("B2_KEY_ID")
-    secret_key = os.environ.get("B2_APP_KEY")
-
-    if not all([endpoint, access_key, secret_key]):
-        # Do not raise HTTPException here; caller will handle if B2 required
-        logger.warning("B2 env credentials are not fully set")
-        _s3_client = None
-        return None
-
-    _s3_client = boto3.resource(
-        "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
-    )
-    return _s3_client
-
-
-def fetch_b2_object_bytes(bucket: str, key: str) -> bytes:
-    s3 = get_s3_resource()
-    if s3 is None:
-        raise HTTPException(status_code=500, detail={"error": "missing_b2_env", "message": "B2 credentials (B2_S3_ENDPOINT/B2_KEY_ID/B2_APP_KEY) not configured"})
-
-    try:
-        obj = s3.Object(bucket, key)
-        data = obj.get()["Body"].read()
-        if not data:
-            raise HTTPException(status_code=500, detail={"error": "b2_empty_file", "message": f"File is empty: s3://{bucket}/{key}"})
-        return data
-    except botocore.exceptions.ClientError as e:
-        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey"):
-            raise HTTPException(status_code=404, detail={"error": "b2_not_found", "message": f"Object not found: s3://{bucket}/{key}"})
-        if code in ("403", "AccessDenied"):
-            raise HTTPException(status_code=403, detail={"error": "b2_access_denied", "message": f"Access denied: s3://{bucket}/{key}"})
-        logger.exception("B2 client error")
-        raise HTTPException(status_code=500, detail={"error": "b2_client_error", "message": str(e)})
-
+load_dotenv()
 
 def reservoir_sample_from_bytes(content_bytes: bytes, sample_size: int = 1000, seed: Optional[int] = None) -> list:
     """
@@ -129,57 +55,6 @@ def reservoir_sample_from_bytes(content_bytes: bytes, sample_size: int = 1000, s
                 reservoir[j] = row
     return reservoir
 
-
-
-def fetch_default_b2_dataset() -> bytes:
-    
-    endpoint = os.environ.get("B2_S3_ENDPOINT")
-    access_key = os.environ.get("B2_KEY_ID")
-    secret_key = os.environ.get("B2_APP_KEY")
-    bucket = os.environ.get("B2_BUCKET")
-    key = os.environ.get("INPUT_PATH")
-
-    if not all([endpoint, access_key, secret_key, bucket, key]):
-        raise HTTPException(status_code=500, detail={
-            "error": "missing_b2_env",
-            "message": "One or more required B2 env vars are missing"
-        })
-
-    try:
-        s3 = boto3.resource(
-            "s3",
-            endpoint_url=endpoint,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-        )
-        obj = s3.Object(bucket, key)
-        data = obj.get()["Body"].read()
-
-        if not data:
-            raise HTTPException(status_code=500, detail={
-                "error": "b2_empty_file",
-                "message": f"File is empty: s3://{bucket}/{key}"
-            })
-
-        return data
-
-    except botocore.exceptions.ClientError as e:
-        code = getattr(e, "response", {}).get("Error", {}).get("Code", "")
-        if code in ("404", "NoSuchKey"):
-            raise HTTPException(status_code=404, detail={
-                "error": "b2_not_found",
-                "message": f"Object not found: s3://{bucket}/{key}"
-            })
-        elif code in ("403", "AccessDenied"):
-            raise HTTPException(status_code=403, detail={
-                "error": "b2_access_denied",
-                "message": f"Cannot access s3://{bucket}/{key}"
-            })
-
-        raise HTTPException(status_code=500, detail={
-            "error": "b2_client_error",
-            "message": str(e)
-        })
 
 try:
     # Preferred when running as package (uvicorn service.main:app)
@@ -653,64 +528,85 @@ async def score_lead(features: LeadFeatures):
 
 @app.post("/bulk-score", response_model=BulkScoreResponse, tags=["Inference"])
 async def bulk_score_leads(
-    file: UploadFile = File(None, description="CSV file containing leads data"),
+    file: Optional[UploadFile] = File(
+        None,
+        description="CSV file containing leads data (optional)"
+    ),
     inference_sample: Optional[int] = 1000,
-    seed: Optional[int] = None,
-    b2_bucket: Optional[str] = None,
-    b2_key: Optional[str] = None,
-    b2_uri: Optional[str] = None
+    seed: Optional[int] = None
 ):
     """
-    Bulk lead scoring inference endpoint.
-    
-    Menerima file CSV berisi multiple customer records dan mengembalikan
-    hasil scoring untuk setiap baris yang valid.
-    
-    Parameters
-    ----------
-    file : UploadFile
-        CSV file dengan kolom yang sesuai dengan REQUIRED_COLUMNS
-    
-    Returns
-    -------
-    BulkScoreResponse
-        Hasil inference untuk semua baris valid, plus summary dan invalid rows
-    
-    Raises
-    ------
-    400
-        - File bukan CSV
-        - File kosong
-        - Melebihi MAX_BULK_ROWS (1000 baris)
-        - Missing required columns
-    500
-        Jika terjadi error saat inference
-    
-    Notes
-    -----
-    - Max 1000 rows per request
-    - Baris dengan missing values akan di-drop dan dilaporkan di invalid_rows
-    - Kolom yang tidak dikenal akan diabaikan (hanya log warning)
+    Bulk lead scoring inference endpoint with optional file upload.
+
+    If file is not provided or fails to load:
+    → automatically load CSV from Backblaze B2 using env variables.
     """
-    
+
     if artifacts is None:
         raise InferenceError("Model artifacts not loaded")
-    
-    # read uploaded file content if provided
+
+    # ============================================================
+    # 1. LOAD CSV (from file if available, else from B2)
+    # ============================================================
+
     content = None
+
+    # --- A) Try reading uploaded file ---
     if file is not None:
         try:
+            if not file.filename.lower().endswith(".csv"):
+                raise HTTPException(status_code=400, detail={
+                    "error": "Invalid file type",
+                    "message": "Only CSV files are accepted",
+                    "filename": file.filename
+                })
             content = await file.read()
-            if content:
-                logger.info("Using uploaded CSV file for bulk inference")
+            if not content:
+                raise ValueError("Uploaded file empty")
         except Exception as e:
-            logger.warning(f"Failed to read uploaded file: {e}")
-            content = None
+            logger.warning(f"Uploaded file load failed, falling back to B2: {e}")
 
-    # fetch from B2 if no uploaded file
-    if not content:
-        logger.info("No valid CSV uploaded, fetching dataset from Backblaze B2")
-        content = fetch_default_b2_dataset()
+    # --- B) If file missing OR failed → Load from Backblaze B2 ---
+    if content is None:
+        import boto3
+        import os
+
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=os.getenv("B2_S3_ENDPOINT"),
+            aws_access_key_id=os.getenv("B2_KEY_ID"),
+            aws_secret_access_key=os.getenv("B2_APP_KEY"),
+        )
+
+        bucket = os.getenv("B2_BUCKET")
+        path = os.getenv("INPUT_PATH")
+
+        print("Bucket:", bucket)
+        print("Path:", path)
+
+        # Validate env vars
+        if not bucket or not path:
+            raise HTTPException(status_code=400, detail={
+                "error": "b2_env_missing",
+                "message": "Required B2 environment variables are missing",
+                "B2_BUCKET": bucket,
+                "INPUT_PATH": path
+            })
+
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=path)
+            content = obj["Body"].read()
+            logger.info(f"Loaded CSV from B2 bucket={bucket} path={path}")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail={
+                "error": "file_not_available",
+                "message": "No file provided and failed to load from B2",
+                "reason": str(e)
+            })
+
+    # ============================================================
+    # 2. PARSE CSV (unchanged logic)
+    # ============================================================
 
     try:
         df_full = pd.read_csv(io.StringIO(content.decode("utf-8")))
@@ -720,43 +616,33 @@ async def bulk_score_leads(
             "message": str(e)
         })
 
-    # Validate file extension quickly
-    if file is not None and not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=400, detail={
-            "error": "Invalid file type",
-            "message": "Only CSV files are accepted",
-            "filename": file.filename
-        })
-
-    # Read full CSV
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail={"error": "Empty file", "message": "Uploaded CSV file is empty"})
-    try:
-
-        df_full = pd.read_csv(io.StringIO(content.decode("utf-8")))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail={"error": "CSV parsing error", "message": str(e)})
-
     total_rows = len(df_full)
     if total_rows == 0:
-        raise HTTPException(status_code=400, detail={"error": "Empty CSV", "message": "CSV file contains no data rows"})
+        raise HTTPException(status_code=400, detail={
+            "error": "Empty CSV",
+            "message": "CSV contains no data rows"
+        })
 
-    # Validate columns on full CSV
+    # Validate required columns
     validation_result = validate_dataframe_columns(df_full)
     missing_cols = validation_result["missing_columns"]
     extra_cols = validation_result["extra_columns"]
+
     if missing_cols:
         raise HTTPException(status_code=400, detail={
             "error": "Missing required columns",
-            "message": f"CSV is missing required columns: {missing_cols}",
+            "message": f"CSV missing: {missing_cols}",
             "missing_columns": missing_cols,
             "required_columns": REQUIRED_INPUT_FIELDS
         })
-    if extra_cols:
-        logger.warning(f"CSV contains extra columns that will be ignored: {extra_cols}")
 
-    # Normalize inference_sample param
+    if extra_cols:
+        logger.warning(f"CSV contains extra columns ignored: {extra_cols}")
+
+    # ============================================================
+    # 3. The rest remains EXACTLY the same
+    # ============================================================
+
     try:
         if inference_sample is None:
             inference_sample = 1000
@@ -765,31 +651,31 @@ async def bulk_score_leads(
             if inference_sample < 0:
                 raise ValueError()
     except Exception:
-        raise HTTPException(status_code=400, detail={"error": "invalid_inference_sample", "message": "inference_sample must be a non-negative integer"})
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_inference_sample",
+            "message": "inference_sample must be a non-negative integer"
+        })
 
-    # Choose rows to process
     if inference_sample == 0 or total_rows <= inference_sample:
         df_to_process = df_full.copy()
         logger.info(f"Processing full dataset: rows={len(df_to_process)}")
     else:
-        # keep original index so we can report original row_index in results
-        df_full_reset = df_full.reset_index()  # original indices in column 'index'
+        df_full_reset = df_full.reset_index()
         sampled_df = df_full_reset.sample(n=inference_sample, random_state=seed)
         sampled_df = sampled_df.rename(columns={"index": "_original_index"})
         sampled_df = sampled_df.set_index("_original_index")
         df_to_process = sampled_df.copy()
-        logger.info(f"Sampling applied: original_rows={total_rows}, sampled_rows={len(df_to_process)}, seed={seed}")
+        logger.info(
+            f"Sampling applied: total={total_rows}, sampled={len(df_to_process)}, seed={seed}"
+        )
 
-    # Prepare for cleaning: ensure '_original_index' exists as column for clean_dataframe contract
     df_work = df_to_process.copy()
     if '_original_index' not in df_work.columns:
         df_work['_original_index'] = df_work.index.tolist()
 
-    # Keep only REQUIRED_INPUT_FIELDS + _original_index (ignore extras)
     cols_keep = [c for c in REQUIRED_INPUT_FIELDS if c in df_work.columns] + ['_original_index']
     df_work = df_work[cols_keep]
 
-    # Clean and validate
     clean_result = clean_dataframe(df_work)
     cleaned_df = clean_result["cleaned_df"]
     original_indices = clean_result["original_indices"]
@@ -799,18 +685,28 @@ async def bulk_score_leads(
     processed_rows = len(cleaned_df)
     dropped_rows = len(dropped_indices)
 
-    # Build invalid rows list
     invalid_rows_response = []
     for idx in dropped_indices:
-        # original index might be in df_work['_original_index']
         try:
             row = df_work.loc[idx]
-            missing_cols_in_row = [col for col in REQUIRED_INPUT_FIELDS if pd.isnull(row.get(col))]
+            missing_cols_in_row = [
+                col for col in REQUIRED_INPUT_FIELDS if pd.isnull(row.get(col))
+            ]
         except Exception:
             missing_cols_in_row = REQUIRED_INPUT_FIELDS
-        invalid_rows_response.append(InvalidRow(row_index=int(idx), reason=f"missing_values: {', '.join(missing_cols_in_row)}"))
+        invalid_rows_response.append(
+            InvalidRow(
+                row_index=int(idx),
+                reason=f"missing_values: {', '.join(missing_cols_in_row)}"
+            )
+        )
     for row_info in invalid_rows_data:
-        invalid_rows_response.append(InvalidRow(row_index=row_info["row_index"], reason=row_info["reason"]))
+        invalid_rows_response.append(
+            InvalidRow(
+                row_index=row_info["row_index"],
+                reason=row_info["reason"]
+            )
+        )
 
     if processed_rows == 0:
         return BulkScoreResponse(
@@ -828,23 +724,30 @@ async def bulk_score_leads(
             predictions=[]
         )
 
-    # Run inference on cleaned sample
     results = run_bulk_inference(cleaned_df, original_indices, artifacts)
 
-    # Build predictions and stats
     predictions_response = []
     conversion_counts = {"High": 0, "Medium": 0, "Low": 0}
     total_probability = 0.0
+
     for r in results:
-        reason_codes = [BulkReasonCode(feature=rc["feature"], direction=rc["direction"], shap_value=rc["shap_value"]) for rc in r["reason_codes"]]
-        predictions_response.append(BulkPrediction(
-            row_index=r["row_index"],
-            probability=r["probability"],
-            prediction=r["prediction"],
-            prediction_label=r["prediction_label"],
-            risk_level=r["risk_level"],
-            reason_codes=reason_codes
-        ))
+        reason_codes = [
+            BulkReasonCode(
+                feature=rc["feature"],
+                direction=rc["direction"],
+                shap_value=rc["shap_value"]
+            ) for rc in r["reason_codes"]
+        ]
+        predictions_response.append(
+            BulkPrediction(
+                row_index=r["row_index"],
+                probability=r["probability"],
+                prediction=r["prediction"],
+                prediction_label=r["prediction_label"],
+                risk_level=r["risk_level"],
+                reason_codes=reason_codes
+            )
+        )
         conversion_counts[r["risk_level"]] += 1
         total_probability += r["probability"]
 
@@ -856,7 +759,7 @@ async def bulk_score_leads(
             total_rows=total_rows,
             processed_rows=processed_rows,
             dropped_rows=dropped_rows,
-            avg_probability=round(avg_probability, 4) if avg_probability is not None else None,
+            avg_probability=round(avg_probability, 4) if avg_probability else None,
             conversion_high=conversion_counts["High"],
             conversion_medium=conversion_counts["Medium"],
             conversion_low=conversion_counts["Low"]
@@ -864,6 +767,7 @@ async def bulk_score_leads(
         invalid_rows=invalid_rows_response,
         predictions=predictions_response
     )
+
 
 
 # =============================================================================
