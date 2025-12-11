@@ -20,47 +20,38 @@ RUN python -m pip install --upgrade pip setuptools wheel \
 # ---- Stage 2: runtime image ----
 FROM python:3.11-slim
 
-# Install runtime OS deps (if any) and minimal utilities
+# Install runtime OS deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user and appdir
+# Create non-root user but stay root for installation
 RUN useradd --create-home --shell /bin/bash appuser \
  && mkdir -p /app /wheels /tmp \
- && chown -R appuser:appuser /app /wheels /tmp
+ && chown -R root:root /wheels /app /tmp
 
 # Copy built wheels from build stage
 COPY --from=build /wheels /wheels
 
-# Switch to non-root user for pip install and runtime
+WORKDIR /app
+
+# Install wheels (running as root) and then delete the wheel cache
+RUN python -m pip install --no-cache-dir /wheels/* \
+ && rm -rf /wheels
+
+# Copy app files and set ownership to appuser
+COPY service/ /app/service/
+COPY service/inference_service.py /app/inference_service.py
+COPY service/artifacts/ /app/artifacts/
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
 USER appuser
 ENV HOME=/home/appuser
 ENV PATH="$HOME/.local/bin:$PATH"
 
-# Install wheels as non-root into user site-packages
-# --no-deps is not used because wheels contain deps we built earlier
-RUN python -m pip install --user --no-cache-dir /wheels/* \
- && rm -rf /wheels
-
-# Copy application code (ensure ownership via current user)
-COPY --chown=appuser:appuser service/ /app/service/
-COPY --chown=appuser:appuser service/inference_service.py /app/inference_service.py
-# copy artifacts (if needed at runtime)
-COPY --chown=appuser:appuser service/artifacts/ /app/artifacts/
-
-WORKDIR /app
-
-# Ensure artifacts readable
-RUN chmod -R a+r /app/artifacts || true
-
-# Cloud Run expects PORT env var  (uvicorn will use this)
-ENV PORT=8080
+# rest of your ENV / CMD...
 ENV PYTHONUNBUFFERED=1
-ENV TMPDIR=/tmp
-
-# Expose port (informational for readers; Cloud Run uses PORT env)
+ENV PORT=8080
 EXPOSE 8080
-
-# Use a simple, production-ready command (adjust path/module as needed)
 CMD ["uvicorn", "service.main:app", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
